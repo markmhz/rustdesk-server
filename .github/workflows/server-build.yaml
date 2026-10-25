@@ -23,40 +23,57 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Native builds per architecture, not a cross build. `native-tls` (pulled in by
+  # tokio-tungstenite via hbb_common) needs an OpenSSL for the target, and
+  # neither a plain musl build nor the cross musl images provide one. Building on
+  # the matching host with the distro's libssl-dev is the variant that reliably
+  # works; the tradeoff is a glibc/OpenSSL3 runtime dependency instead of a fully
+  # static binary.
   linux:
-    name: linux ${{ matrix.target }}
-    runs-on: ubuntu-22.04
+    name: linux ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
+          - runner: ubuntu-22.04
             artifact: linux-amd64
-          - target: aarch64-unknown-linux-musl
+          - runner: ubuntu-22.04-arm
             artifact: linux-arm64
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # `cross` is required, not optional: hbb_common pulls tokio-tungstenite,
-      # which enables native-tls, which needs an OpenSSL for the target. A plain
-      # `cargo build` against musl fails with "Could not find directory of
-      # OpenSSL installation"; the cross images ship a musl OpenSSL.
-      - name: Build (cross)
-        uses: houseabsolute/actions-rust-cross@v1
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install OpenSSL headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
         with:
-          command: build
-          target: ${{ matrix.target }}
-          args: --release --locked --bin hbbs --bin hbbr
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.artifact }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      # `sqlx::query!` needs the schema at compile time, which is why the
+      # checked-in db_v2.sqlite3 and .env must stay in the tree.
+      - name: Build
+        run: cargo build --release --locked --bin hbbs --bin hbbr
 
       - name: Collect binaries
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/hbbs" dist/
-          cp "target/${{ matrix.target }}/release/hbbr" dist/
+          cp target/release/hbbs target/release/hbbr dist/
           strip dist/hbbs dist/hbbr 2>/dev/null || true
           (cd dist && sha256sum hbbs hbbr > SHA256SUMS)
+          echo "--- runtime dependencies ---"
+          ldd dist/hbbs || true
 
       - uses: actions/upload-artifact@v4
         with:
