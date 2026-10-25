@@ -13,7 +13,7 @@ use hbb_common::{
     log,
     protobuf::{Message as _, MessageField},
     rendezvous_proto::{
-        register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
+        register_pk_response::Result::{NOT_DEPLOYED, TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
     tcp::FramedStream,
@@ -134,6 +134,8 @@ impl RendezvousServer {
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
+        crate::acl::init(pm.db.clone())?;
+        crate::api::spawn(pm.clone());
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
@@ -374,6 +376,24 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
                     if !rp.id.is_empty() && rp.id.len() <= MAX_PEER_ID_LEN {
+                        if !crate::acl::is_allowed(&rp.id).await {
+                            // Answer like an unknown peer would be answered, but never
+                            // track its address: an unapproved device must not become
+                            // reachable. Staying silent here would also starve the
+                            // `test_hbbs` liveness probe, which exits the process after
+                            // twelve seconds without a reply.
+                            log::debug!(
+                                "Peer {} from {} is not approved, not keeping it online",
+                                rp.id,
+                                addr
+                            );
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_register_peer_response(RegisterPeerResponse {
+                                request_pk: true,
+                                ..Default::default()
+                            });
+                            return socket.send(&msg_out, addr).await;
+                        }
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
                         self.update_addr(rp.id, addr, socket).await?;
                         if self.inner.serial > rp.serial {
@@ -397,6 +417,17 @@ impl RendezvousServer {
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
                     } else if !self.check_ip_blocker(&ip, &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                    }
+                    if !crate::acl::is_allowed(&id).await {
+                        // Remember unknown devices so an administrator can approve them,
+                        // then refuse the registration until that happens.
+                        if let Err(err) =
+                            crate::acl::record_pending(&id, &rk.uuid, &rk.pk, &ip).await
+                        {
+                            log::error!("failed to record pending device {}: {}", id, err);
+                        }
+                        log::info!("Refused key registration of {} from {}: not approved", id, ip);
+                        return send_rk_res(socket, addr, NOT_DEPLOYED).await;
                     }
                     let peer = self.pm.get_or(&id).await;
                     let (changed, ip_changed) = {
@@ -737,6 +768,19 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         let id = ph.id;
+        if !crate::acl::is_allowed(&id).await {
+            log::warn!(
+                "Refused punch hole request from {} to {}: target is not approved",
+                addr,
+                id
+            );
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
         // punch hole request from A, relay to B,
         // check if in same intranet first,
         // fetch local addrs if in same intranet.

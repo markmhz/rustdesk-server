@@ -8,7 +8,10 @@ use hbb_common::{
     ResultType,
 };
 use serde_derive::{Deserialize, Serialize};
-use std::{collections::HashMap, collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap, collections::HashSet, net::SocketAddr, sync::Arc, time::Duration,
+    time::Instant,
+};
 
 type IpBlockMap = HashMap<String, ((u32, Instant), (HashSet<String>, Instant))>;
 type UserStatusMap = HashMap<Vec<u8>, Arc<(Option<Vec<u8>>, bool)>>;
@@ -30,6 +33,14 @@ pub const MAX_PEER_ID_LEN: usize = 253;
 pub(crate) struct PeerInfo {
     #[serde(default)]
     pub(crate) ip: String,
+}
+
+/// One entry of the in-memory peer table, as reported by the management API.
+#[derive(Debug, Serialize)]
+pub(crate) struct PeerSnapshot {
+    pub(crate) id: String,
+    pub(crate) ip: String,
+    pub(crate) online: bool,
 }
 
 pub(crate) struct Peer {
@@ -179,5 +190,21 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+
+    /// Snapshot of every peer currently held in memory, with its online state
+    /// derived from how long ago it last registered.
+    pub(crate) async fn online_snapshot(&self, timeout: Duration) -> Vec<PeerSnapshot> {
+        let map = self.map.read().await;
+        let mut out = Vec::with_capacity(map.len());
+        for (id, peer) in map.iter() {
+            let peer = peer.read().await;
+            out.push(PeerSnapshot {
+                id: id.clone(),
+                ip: peer.info.ip.clone(),
+                online: !peer.uuid.is_empty() && peer.last_reg_time.elapsed() < timeout,
+            });
+        }
+        out
     }
 }

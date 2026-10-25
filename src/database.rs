@@ -141,6 +141,56 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    /// Insert a peer unless the id is already known, so that callers can record
+    /// a device without racing with a concurrent registration.
+    pub async fn insert_or_ignore(
+        &self,
+        id: &str,
+        uuid: &[u8],
+        pk: &[u8],
+        info: &str,
+        status: Option<i64>,
+    ) -> ResultType<bool> {
+        let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let res = sqlx::query!(
+            "insert or ignore into peer(guid, id, uuid, pk, info, status) values(?, ?, ?, ?, ?, ?)",
+            guid,
+            id,
+            uuid,
+            pk,
+            info,
+            status
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Set the approval status of a peer. Returns false when the id is unknown.
+    pub async fn set_status(&self, id: &str, status: i64) -> ResultType<bool> {
+        let res = sqlx::query!("update peer set status=? where id=?", status, id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn list_peers(&self, limit: i64) -> ResultType<Vec<Peer>> {
+        Ok(sqlx::query_as!(
+            Peer,
+            "select guid, id, uuid, pk, user, status, info from peer order by created_at desc limit ?",
+            limit
+        )
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn delete_peer(&self, id: &str) -> ResultType<bool> {
+        let res = sqlx::query!("delete from peer where id=?", id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 #[cfg(test)]
